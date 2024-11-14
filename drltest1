@@ -1,0 +1,125 @@
+import pandas as pd
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+matplotlib.use('Agg')
+import datetime
+import sys
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+# 添加 stable-baselines3 的路径
+sys.path.append('F:\investproject2\stable-baselines3')
+
+from stable_baselines3 import A2C
+from stable_baselines3.common.envs import DummyVecEnv
+from stable_baselines3.common.evaluation import evaluate_policy
+
+# Load Hugging Face model for sentiment analysis
+tokenizer = AutoTokenizer.from_pretrained("nlptown/bert-base-multilingual-uncased-sentiment")
+model = AutoModelForSequenceClassification.from_pretrained("nlptown/bert-base-multilingual-uncased-sentiment")
+
+def get_sentiment_score(text):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    outputs = model(**inputs)
+    scores = outputs.logits.detach().numpy()
+    sentiment = np.argmax(scores, axis=1)
+    return sentiment[0]
+
+# Example usage of sentiment analysis
+sample_text = "The stock market is doing great today!"
+sentiment_score = get_sentiment_score(sample_text)
+print(f"Sentiment score: {sentiment_score}")
+
+# Input data
+datafilename = "drive/My Drive/data/selected_stock_data_f_5min.xlsx"
+testfilename="drive/My Drive/data/stock_data_testing/selected_stock_data_test_f_5min.xlsx"
+INIT_FUND = 1e8
+print(f"Initial fund available: {INIT_FUND}")
+stock_data = pd.read_excel(datafilename, header=[0], parse_dates=True)
+test_data = pd.read_excel(testfilename, header=[0], parse_dates=True)
+
+# Data preprocess
+def data_preprocess(stock_data):
+    stock_data_2 = pd.DataFrame(columns=['date', 'tic', 'open', 'high', 'low', 'close', 'volume'])
+    for i in range(0, 10):
+        temp_data = stock_data.iloc[:, [0, i*5+1, i*5+2, i*5+3, i*5+4, i*5+5]]
+        temp_data.insert(temp_data.shape[1], 'stock', 'STOCK_%d' % (i + 1))
+        temp_data.columns = ['date', 'volume', 'open', 'low', 'high', 'close', 'tic']
+        stock_data_2 = stock_data_2.append(temp_data)
+    return stock_data_2.reset_index(drop=True)
+
+stock_data_2 = data_preprocess(stock_data)
+test_data_2 = data_preprocess(test_data)
+print(stock_data_2.shape)
+print(test_data_2.shape)
+df = stock_data_2.append(test_data_2)
+
+# Feature engineering
+def add_technical_indicators(df):
+    df['close_30_sma'] = df['close'].rolling(window=30).mean()
+    df['close_60_sma'] = df['close'].rolling(window=60).mean()
+    df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
+    df['boll_ub'] = df['close'].rolling(window=20).mean() + df['close'].rolling(window=20).std() * 2
+    df['boll_lb'] = df['close'].rolling(window=20).mean() - df['close'].rolling(window=20).std() * 2
+    df['rsi_30'] = 100 - (100 / (1 + df['close'].pct_change().rolling(window=30).mean()))
+    df['cci_30'] = (df['close'] - df['close'].rolling(window=30).mean()) / (0.015 * df['close'].rolling(window=30).std())
+    return df
+
+df = add_technical_indicators(df)
+result = df[['date', 'tic', 'close', 'close_30_sma', 'close_60_sma', 'macd', 'boll_ub', 'boll_lb', 'rsi_30', 'cci_30']].tail(20)
+result.set_index(['date'], inplace=True)
+print(result)
+
+# Environment design
+def data_split(df, start, end):
+    data = df[(df['date'] >= start) & (df['date'] < end)]
+    data = data.sort_values(['date', 'tic'], ignore_index=True)
+    data.index = data['date'].factorize()[0]
+    return data
+
+train = data_split(df, '2020-09-01 09:30:00', '2020-12-31 15:00:00')
+trade = data_split(df, '2020-12-31 15:00:00', '2021-03-31 15:00:00')
+stock_dimension = len(train.tic.unique())
+state_space = 1 + 2 * stock_dimension + len(['close_30_sma', 'close_60_sma', 'macd', 'boll_ub', 'boll_lb', 'rsi_30', 'cci_30']) * stock_dimension
+print(f"Stock Dimension: {stock_dimension}, State Space: {state_space}")
+env_kwargs = {
+    "hmax": 100,
+    "initial_amount": 1e6,
+    "buy_cost_pct": 0,
+    "sell_cost_pct": 0,
+    "state_space": state_space,
+    "stock_dim": stock_dimension,
+    "tech_indicator_list": ['close_30_sma', 'close_60_sma', 'macd', 'boll_ub', 'boll_lb', 'rsi_30', 'cci_30'],
+    "action_space": stock_dimension,
+    "reward_scaling": 1e-4
+}
+
+class StockTradingEnv:
+    # Define your custom environment here
+    pass
+
+e_train_gym = StockTradingEnv(df=train, **env_kwargs)
+env_train = DummyVecEnv([lambda: e_train_gym])
+
+# Algorithm implement
+model_a2c = A2C('MlpPolicy', env_train, verbose=1)
+model_a2c.learn(total_timesteps=50000)
+
+# Trading
+e_trade_gym = StockTradingEnv(df=trade, **env_kwargs)
+env_trade = DummyVecEnv([lambda: e_trade_gym])
+df_account_value, df_actions = model_a2c.predict(env_trade)
+
+# Backtest our strategy
+print("==============Get Backtest Results===========")
+now = datetime.datetime.now().strftime('%Y%m%d-%Hh%M')
+perf_stats_all = backtest_stats(account_value=df_account_value)
+perf_stats_all = pd.DataFrame(perf_stats_all)
+perf_stats_all.to_csv("./perf_stats_all_" + now + '.csv')
+df_account_value['date'] = pd.to_datetime(df_account_value['date'])
+test_returns = get_daily_return(df_account_value, value_col_name='account_value')
+print(test_returns)
+import pyfolio
+with pyfolio.plotting.plotting_context(font_scale=1.1):
+    pyfolio.create_full_tear_sheet(returns=test_returns, set_context=False)
+qs.plots.snapshot(test_returns, title='weighted distribution performance', figsize=(12, 8), lw=2, fontname="DejaVu Sans")
